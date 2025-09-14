@@ -195,8 +195,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ---------- Camera (boxed) ----------
         cam_box, cam_v = _section("Camera")
-        self.fx = dspin(1, 10000, 600.0, decimals=2)
-        self.fy = dspin(1, 10000, 600.0, decimals=2)
+        self.fx = dspin(1, 10000, 320.0, decimals=2)
+        self.fy = dspin(1, 10000, 320.0, decimals=2)
         self.cx = dspin(0, 8192, 320.0, decimals=2)
         self.cy = dspin(0, 8192, 240.0, decimals=2)
         self.w  = ispin(16, 8192, 640)
