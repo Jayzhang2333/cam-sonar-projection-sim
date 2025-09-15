@@ -32,10 +32,7 @@ def np_to_qpixmap(img):
         return _QtGui.QPixmap.fromImage(qimg)
     else:
         assert img.ndim == 3 and img.shape[2] in (3, 4), "Expected HxWx3 (or 4) image"
-        if img.shape[2] == 4:
-            arr = img[:, :, :3]
-        else:
-            arr = img
+        arr = img[:, :, :3] if img.shape[2] == 4 else img
         arr = _np.ascontiguousarray(arr.astype(_np.uint8, copy=False))
         h, w, _ = arr.shape
         buf = arr.tobytes()
@@ -57,7 +54,6 @@ def sonar_to_cam_base_R():
     return np.column_stack([ex, ey, ez]).astype(np.float32)
 
 
-# small label factory
 def _lab(text, small=False, bold=False, color="#000"):
     lbl = QtWidgets.QLabel(text)
     lbl.setWordWrap(True)
@@ -96,26 +92,22 @@ def _param_row(name, unit, widget, value_width=96, label_width=112):
     g.setColumnStretch(1, 0)
     return w
 
+
 def _section(title: str):
     """
     Thin-bounded QGroupBox section with tight margins and a BOLD title.
-    Uses QFont bold on the group box (more reliable across platforms/styles
-    than QSS on QGroupBox::title).
+    Uses QFont bold on the group box (more reliable across platforms/styles).
     Returns (group_box, inner_vlayout).
     """
     gb = QtWidgets.QGroupBox(title)
-    # Make the title bold via QFont (works even when stylesheets ignore font-weight)
-    f = gb.font()
-    f.setBold(True)
-    gb.setFont(f)
-
+    f = gb.font(); f.setBold(True); gb.setFont(f)
     gb.setFlat(False)
     gb.setStyleSheet("""
         QGroupBox {
             border: 1px solid #777;
             border-radius: 6px;
-            margin-top: 8px;      /* space for the title */
-            padding-top: 4px;     /* title inset */
+            margin-top: 8px;
+            padding-top: 4px;
         }
         QGroupBox::title {
             subcontrol-origin: margin;
@@ -127,6 +119,110 @@ def _section(title: str):
     v.setContentsMargins(6, 4, 6, 6)
     v.setSpacing(4)
     return gb, v
+
+
+class DepthInspectorDialog(QtWidgets.QDialog):
+    """
+    Modal dialog to inspect the depth map:
+      - Histogram (valid <= max_depth_m)
+      - Preview image (NaN gray, >max red)
+      - Quick stats
+    """
+    def __init__(self, depth_m: np.ndarray, max_depth_m: float, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Depth Inspector")
+        self.resize(700, 520)
+        v = QtWidgets.QVBoxLayout(self)
+        v.setContentsMargins(8, 8, 8, 8)
+        v.setSpacing(6)
+
+        # Stats
+        stats_box = QtWidgets.QGroupBox("Stats")
+        stats_layout = QtWidgets.QGridLayout(stats_box)
+        stats_layout.setContentsMargins(6, 4, 6, 4)
+        stats_layout.setHorizontalSpacing(12)
+
+        D = np.array(depth_m, dtype=np.float32)
+        valid = np.isfinite(D) & (D > 0) & (D <= max_depth_m)
+        n_total = D.size
+        n_valid = int(np.count_nonzero(valid))
+        n_nan = int(np.count_nonzero(~np.isfinite(D)))
+        n_le0 = int(np.count_nonzero(np.isfinite(D) & (D <= 0)))
+        n_gt = int(np.count_nonzero(np.isfinite(D) & (D > max_depth_m)))
+
+        if n_valid:
+            vals = D[valid]
+            dmin, dmax = float(np.min(vals)), float(np.max(vals))
+            dmed = float(np.median(vals))
+            d95 = float(np.percentile(vals, 95))
+        else:
+            dmin = dmax = dmed = d95 = float('nan')
+
+        rows = [
+            ("Resolution", f"{D.shape[1]} × {D.shape[0]}"),
+            (f"Valid (≤ {max_depth_m:g} m)", f"{n_valid:,} / {n_total:,}"),
+            ("NaN/Inf", f"{n_nan:,}"),
+            ("≤ 0 m", f"{n_le0:,}"),
+            (f"> {max_depth_m:g} m", f"{n_gt:,}"),
+            ("Min/Max (valid)", f"{dmin:.3g} / {dmax:.3g} m"),
+            ("Median / P95", f"{dmed:.3g} / {d95:.3g} m"),
+        ]
+        for r, (k, vtxt) in enumerate(rows):
+            stats_layout.addWidget(QtWidgets.QLabel(k), r, 0)
+            val = QtWidgets.QLabel(vtxt); val.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+            stats_layout.addWidget(val, r, 1)
+
+        v.addWidget(stats_box)
+
+        # Plots (matplotlib)
+        from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+        from matplotlib.figure import Figure
+        fig = Figure(figsize=(6.4, 3.8), dpi=100)
+        canvas = FigureCanvas(fig)
+        ax1 = fig.add_subplot(1, 2, 1)
+        ax2 = fig.add_subplot(1, 2, 2)
+        fig.tight_layout(pad=2.0, w_pad=2.5)
+
+        # Histogram
+        ax1.set_title(f"Histogram (≤ {max_depth_m:g} m)")
+        if n_valid:
+            ax1.hist(vals, bins=100, range=(0, min(max_depth_m, max(5.0, float(np.nanpercentile(vals, 99.5))))), alpha=0.8)
+            ax1.set_xlabel("Depth (m)"); ax1.set_ylabel("Count")
+        else:
+            ax1.text(0.5, 0.5, "No valid data", ha='center', va='center', transform=ax1.transAxes)
+            ax1.set_xticks([]); ax1.set_yticks([])
+
+        # Preview image
+        ax2.set_title("Preview")
+        # Build RGB preview: valid depths mapped with 'viridis', NaN gray, >max red
+        vis = np.zeros((*D.shape, 3), dtype=np.float32)
+        mask_valid = valid
+        mask_nan = ~np.isfinite(D)
+        mask_big = np.isfinite(D) & (D > max_depth_m)
+
+        if n_valid:
+            vmin = max(0.0, float(np.min(D[mask_valid])))
+            vmax = float(np.percentile(D[mask_valid], 99.0))
+            vmax = max(vmax, vmin + 1e-3)
+            norm = (np.clip(D, vmin, vmax) - vmin) / (vmax - vmin)
+            import matplotlib.cm as cm
+            cmap = cm.get_cmap('viridis')
+            vis[mask_valid] = cmap(norm)[..., :3][mask_valid]
+        vis[mask_nan] = np.array([0.5, 0.5, 0.5])    # gray
+        vis[mask_big] = np.array([1.0, 0.0, 0.0])    # red
+        ax2.imshow(vis)
+        ax2.axis('off')
+
+        v.addWidget(canvas)
+
+        # Close
+        btn = QtWidgets.QPushButton("Close")
+        btn.clicked.connect(self.accept)
+        btn.setFixedWidth(96)
+        btn.setMinimumHeight(26)
+        h = QtWidgets.QHBoxLayout()
+        h.addStretch(1); h.addWidget(btn)
+        v.addLayout(h)
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -175,28 +271,38 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ---------- Inputs (boxed) ----------
         inputs_box, inputs_v = _section("Inputs")
-        self.btn_rgb = QtWidgets.QPushButton("Load RGB")
-        self.btn_rgb.setMaximumWidth(128)
+        self.btn_rgb = QtWidgets.QPushButton("Load RGB");   self.btn_rgb.setMaximumWidth(128)
         self.lbl_rgb = _lab("—", small=True, color="#555")
-        self.btn_depth = QtWidgets.QPushButton("Load Depth")
-        self.btn_depth.setMaximumWidth(128)
+        self.btn_depth = QtWidgets.QPushButton("Load Depth"); self.btn_depth.setMaximumWidth(128)
+        # Inspect button
+        self.btn_inspect = QtWidgets.QPushButton("Inspect"); self.btn_inspect.setMaximumWidth(80)
         self.lbl_depth = _lab("—", small=True, color="#555")
         # Depth scale: 1 decimal, step 0.1
         self.depth_scale = dspin(1e-6, 1e3, 1.0, decimals=1, step=0.1)
         self.downsample  = ispin(1, 8, 2)
+        # NEW: user-selectable maximum usable depth (meters)
+        self.depth_max   = dspin(0.1, 10000.0, 100.0, decimals=1, step=1.0)
 
         inputs_v.addWidget(self.btn_rgb)
         inputs_v.addWidget(self.lbl_rgb)
-        inputs_v.addWidget(self.btn_depth)
+
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(6)
+        row.addWidget(self.btn_depth)
+        row.addWidget(self.btn_inspect)
+        row.addStretch(1)
+        inputs_v.addLayout(row)
+
         inputs_v.addWidget(self.lbl_depth)
         inputs_v.addWidget(_param_row("Depth scale", "[m / unit]", self.depth_scale))
+        inputs_v.addWidget(_param_row("Depth max", "[m]", self.depth_max))
         inputs_v.addWidget(_param_row("Downsample", "[px step]", self.downsample))
         host_v.addWidget(inputs_box)
 
         # ---------- Camera (boxed) ----------
         cam_box, cam_v = _section("Camera")
-        self.fx = dspin(1, 10000, 320.0, decimals=2)
-        self.fy = dspin(1, 10000, 320.0, decimals=2)
+        self.fx = dspin(1, 10000, 600.0, decimals=2)
+        self.fy = dspin(1, 10000, 600.0, decimals=2)
         self.cx = dspin(0, 8192, 320.0, decimals=2)
         self.cy = dspin(0, 8192, 240.0, decimals=2)
         self.w  = ispin(16, 8192, 640)
@@ -300,6 +406,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Hooks
         self.btn_rgb.clicked.connect(self.on_load_rgb)
         self.btn_depth.clicked.connect(self.on_load_depth)
+        self.btn_inspect.clicked.connect(self.on_inspect_depth)
         self.btn_render.clicked.connect(self.on_render)
 
     # --------- Loaders ----------
@@ -341,15 +448,30 @@ class MainWindow(QtWidgets.QMainWindow):
             if D.ndim != 2:
                 raise ValueError(f"Depth must be single-channel (HxW). Got shape {D.shape}.")
             D = np.array(D, dtype=np.float32) * float(self.depth_scale.value())
-            invalid = ~np.isfinite(D) | (D <= 0.0)
-            if np.any(invalid):
-                D[invalid] = np.nan
+
+            # Sanitize: invalid → NaN; ignore > depth_max → NaN
+            max_d = float(self.depth_max.value())
+            invalid = ~np.isfinite(D) | (D <= 0.0) | (D > max_d)
+            if np.any(invalid): D[invalid] = np.nan
+
             self.depth = D
             H, W = D.shape
             n_valid = int(np.isfinite(D).sum())
             self.lbl_depth.setText(f"{path}  |  valid: {n_valid:,} / {H*W:,}")
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Load depth failed", str(e))
+
+    def on_inspect_depth(self):
+        if self.depth is None:
+            QtWidgets.QMessageBox.information(self, "No depth", "Load a depth map first.")
+            return
+        # Ensure > max depth is invalid in case the scale or max changed
+        D = np.array(self.depth, dtype=np.float32)
+        max_d = float(self.depth_max.value())
+        mask_bad = np.isfinite(D) & (D > max_d)
+        if np.any(mask_bad): D[mask_bad] = np.nan
+        dlg = DepthInspectorDialog(D, max_d, self)
+        dlg.exec_()
 
     # --------- Pipeline ----------
     def on_render(self):
@@ -365,6 +487,13 @@ class MainWindow(QtWidgets.QMainWindow):
             Dimg = Image.fromarray(self.depth, mode="F").resize((W, H), Image.NEAREST)
             self.depth = np.array(Dimg, dtype=np.float32)
 
+        # Enforce ignore > max depth (again, in case values/scale changed)
+        D = np.array(self.depth, dtype=np.float32)
+        max_d = float(self.depth_max.value())
+        bad = ~np.isfinite(D) | (D <= 0.0) | (D > max_d)
+        if np.any(bad): D[bad] = np.nan
+        self.depth = D
+
         self.K = (fx, fy, cx, cy)
         self.image_size = (W, H)
 
@@ -379,9 +508,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Point cloud from depth (camera frame)
         ds = int(self.downsample.value())
-        pts_c, uv = depth_to_points(self.depth, fx, fy, cx, cy, downsample=ds)
+        pts_c, uv = depth_to_points(self.depth, fx, fy, cx, cy, downsample=ds, max_depth_m=max_d)
         if pts_c.shape[0] == 0:
-            QtWidgets.QMessageBox.warning(self, "Empty cloud", "No valid depth points after sanitization.")
+            QtWidgets.QMessageBox.warning(self, "Empty cloud", f"No valid depth points after sanitization (≤ {max_d:g} m).")
             return
 
         sonar = SonarModel(

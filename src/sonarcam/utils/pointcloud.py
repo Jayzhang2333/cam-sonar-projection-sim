@@ -1,31 +1,33 @@
 import numpy as np
 
-def depth_to_points(depth_m, fx, fy, cx, cy, downsample=2):
+def depth_to_points(depth_m: np.ndarray, fx, fy, cx, cy, downsample=2, max_depth_m: float = 100.0):
     """
-    Back-project a depth map (meters) to 3D points in the CAMERA frame.
-    Returns:
-      pts_c: Nx3 float32
-      uv:    Nx2 float32 (pixel coords in original resolution)
+    Convert depth (meters) to camera-frame points (X right, Y down, Z forward),
+    returning:
+      pts_c : (N,3) float32
+      uv    : (N,2) float32 pixel coords (u=x, v=y)
+
+    Invalid depths (NaN/Inf), <= 0, or > max_depth_m are ignored.
     """
-    D = depth_m
-    H, W = D.shape[:2]
+    D = np.asarray(depth_m, dtype=np.float32)
+    H, W = D.shape
     ds = max(1, int(downsample))
 
-    ys = np.arange(0, H, ds)
-    xs = np.arange(0, W, ds)
-    grid_x, grid_y = np.meshgrid(xs, ys)
-    z = D[grid_y, grid_x].astype(np.float32)
-    mask = np.isfinite(z) & (z > 0.0)
-    if not np.any(mask):
-        return np.zeros((0,3), np.float32), np.zeros((0,2), np.float32)
+    # Sample grid
+    v = np.arange(0, H, ds, dtype=np.float32)
+    u = np.arange(0, W, ds, dtype=np.float32)
+    UU, VV = np.meshgrid(u, v)
+    Z = D[::ds, ::ds]
 
-    u = grid_x[mask].astype(np.float32)
-    v = grid_y[mask].astype(np.float32)
+    # Valid mask (≤ max depth enforced)
+    M = np.isfinite(Z) & (Z > 0.0) & (Z <= float(max_depth_m))
+    if not np.any(M):
+        return np.empty((0, 3), np.float32), np.empty((0, 2), np.float32)
 
-    X = (u - cx) / fx * z[mask]
-    Y = (v - cy) / fy * z[mask]   # +Y down in camera; that's fine in camera frame
-    Z = z[mask]
+    UU = UU[M]; VV = VV[M]; Z = Z[M]
 
-    pts = np.stack([X, Y, Z], axis=-1).astype(np.float32)
-    uv  = np.stack([u, v], axis=-1).astype(np.float32)
+    X = (UU - float(cx)) * Z / float(fx)
+    Y = (VV - float(cy)) * Z / float(fy)
+    pts = np.stack([X, Y, Z], axis=1).astype(np.float32)
+    uv = np.stack([UU, VV], axis=1).astype(np.float32)
     return pts, uv

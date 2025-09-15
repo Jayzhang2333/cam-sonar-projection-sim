@@ -12,6 +12,11 @@ from ..models.sonar import ScanOrientation
 class WorldView3D(QtWidgets.QWidget):
     """
     Matplotlib 3D viewer with zoom/pan; trimmed whitespace and larger axes.
+
+    Camera-aligned initial view:
+      - Viewer looks roughly along +X_cam
+      - Screen vertical = +Y_cam (but inverted so +Y goes DOWN on screen)
+      - Screen horizontal = Z_cam
     """
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -86,11 +91,35 @@ class WorldView3D(QtWidgets.QWidget):
         # Tight limits
         xlim, ylim, zlim = self._auto_limits(P, default=max(2.0, 0.8 * span))
         self.ax.set_xlim(xlim); self.ax.set_ylim(ylim); self.ax.set_zlim(zlim)
-        self.ax.set_xlabel('X (cam)', labelpad=1); self.ax.set_ylabel('Y (cam)', labelpad=1); self.ax.set_zlabel('Z (cam)', labelpad=1)
-        self.ax.view_init(elev=20, azim=-60)
+
+        # Apply camera-level view:
+        #   - look ~ along +X (so screen plane is Y–Z)
+        #   - invert Y so +Y points DOWN on screen (camera convention)
+        self._apply_cam_level_view()
+        self._ensure_y_down()
+
+        self.ax.set_xlabel('X (cam)', labelpad=1)
+        self.ax.set_ylabel('Y↓ (cam)', labelpad=1)   # make it explicit
+        self.ax.set_zlabel('Z (cam)', labelpad=1)
         self.canvas.draw_idle()
 
     # ---- Internals ----
+    def _apply_cam_level_view(self):
+        """
+        View so that:
+          - screen vertical is +Y_cam (we'll flip it to go down),
+          - screen horizontal is Z_cam,
+          - viewing direction ~ +X_cam.
+        In mpl, elev=0, azim=-90 looks toward +X.
+        """
+        self.ax.view_init(elev=0, azim=-90)
+
+    def _ensure_y_down(self):
+        """Invert Y axis if needed so +Y goes downward on screen."""
+        y0, y1 = self.ax.get_ylim()
+        if y1 > y0:  # normal (upwards)
+            self.ax.set_ylim(y1, y0)  # flip so +Y is down
+
     def _scene_span(self, P, fallback=2.0):
         if P is None or P.size == 0:
             return fallback
@@ -174,11 +203,22 @@ class WorldView3D(QtWidgets.QWidget):
     def _on_key(self, event):
         if event.key in ('+', '='): self._zoom_axes(self._zoom_factor)
         elif event.key in ('-', '_'): self._zoom_axes(1.0 / self._zoom_factor)
+        elif event.key in ('r', 'R'):  # reset to camera-level view (Y down)
+            self._apply_cam_level_view()
+            self._ensure_y_down()
+            self.canvas.draw_idle()
 
     def _zoom_axes(self, factor):
         def scale(lim):
-            c = 0.5 * (lim[0] + lim[1]); r0 = 0.5 * (lim[1] - lim[0]); r1 = r0 * factor
-            return (c - r1, c + r1)
+            # Preserve current orientation (including inverted Y)
+            c = 0.5 * (lim[0] + lim[1])
+            r0 = 0.5 * (lim[1] - lim[0])
+            r1 = r0 * factor
+            normal_order = lim[1] > lim[0]
+            if normal_order:
+                return (c - r1, c + r1)
+            else:
+                return (c + r1, c - r1)
         self.ax.set_xlim(scale(self.ax.get_xlim()))
         self.ax.set_ylim(scale(self.ax.get_ylim()))
         self.ax.set_zlim(scale(self.ax.get_zlim()))
