@@ -1,44 +1,10 @@
 from PyQt5 import QtWidgets, QtCore, QtGui
-import os
 import numpy as np
-from PIL import Image
 
 from ..models.sonar import SonarModel, ScanOrientation
-from ..utils.transforms import rpy_to_R, Rt_to_T, inv_T
-from ..utils.sonar_viz import polar_to_fan_image
-from ..utils.pointcloud import depth_to_points
-from ..renderers.sonar_from_depth import render_sonar_from_depth
+from ..utils.transforms import rpy_to_R, Rt_to_T
 from .world_view_3d import WorldView3D
-
-
-# --------- helpers ---------
-def np_to_qpixmap(img):
-    """
-    Robust NumPy -> QPixmap:
-    - accepts HxW (gray) or HxWx3 (RGB)
-    - ensures uint8 + contiguous
-    - uses a bytes buffer so PyQt5 QImage ctor is happy
-    - keeps a reference to the buffer on the QImage to avoid GC
-    """
-    import numpy as _np
-    from PyQt5 import QtGui as _QtGui
-
-    if img.ndim == 2:
-        arr = _np.ascontiguousarray(img.astype(_np.uint8, copy=False))
-        h, w = arr.shape
-        buf = arr.tobytes()
-        qimg = _QtGui.QImage(buf, w, h, w, _QtGui.QImage.Format_Grayscale8)
-        qimg._buf = buf
-        return _QtGui.QPixmap.fromImage(qimg)
-    else:
-        assert img.ndim == 3 and img.shape[2] in (3, 4), "Expected HxWx3 (or 4) image"
-        arr = img[:, :, :3] if img.shape[2] == 4 else img
-        arr = _np.ascontiguousarray(arr.astype(_np.uint8, copy=False))
-        h, w, _ = arr.shape
-        buf = arr.tobytes()
-        qimg = _QtGui.QImage(buf, w, h, 3 * w, _QtGui.QImage.Format_RGB888)
-        qimg._buf = buf
-        return _QtGui.QPixmap.fromImage(qimg)
+from .projection_view import ProjectionView
 
 
 def sonar_to_cam_base_R():
@@ -66,10 +32,6 @@ def _lab(text, small=False, bold=False, color="#000"):
 
 
 def _param_row(name, unit, widget, value_width=96, label_width=112):
-    """
-    Two-row label (name + unit) on the left; value widget on the right,
-    vertically centered spanning the two rows. Extra tight layout.
-    """
     w = QtWidgets.QWidget()
     g = QtWidgets.QGridLayout(w)
     g.setContentsMargins(2, 2, 2, 2)
@@ -94,11 +56,6 @@ def _param_row(name, unit, widget, value_width=96, label_width=112):
 
 
 def _section(title: str):
-    """
-    Thin-bounded QGroupBox section with tight margins and a BOLD title.
-    Uses QFont bold on the group box (more reliable across platforms/styles).
-    Returns (group_box, inner_vlayout).
-    """
     gb = QtWidgets.QGroupBox(title)
     f = gb.font(); f.setBold(True); gb.setFont(f)
     gb.setFlat(False)
@@ -121,126 +78,30 @@ def _section(title: str):
     return gb, v
 
 
-class DepthInspectorDialog(QtWidgets.QDialog):
-    """
-    Modal dialog to inspect the depth map:
-      - Histogram (valid <= max_depth_m)
-      - Preview image (NaN gray, >max red)
-      - Quick stats
-    """
-    def __init__(self, depth_m: np.ndarray, max_depth_m: float, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Depth Inspector")
-        self.resize(700, 520)
-        v = QtWidgets.QVBoxLayout(self)
-        v.setContentsMargins(8, 8, 8, 8)
-        v.setSpacing(6)
-
-        # Stats
-        stats_box = QtWidgets.QGroupBox("Stats")
-        stats_layout = QtWidgets.QGridLayout(stats_box)
-        stats_layout.setContentsMargins(6, 4, 6, 4)
-        stats_layout.setHorizontalSpacing(12)
-
-        D = np.array(depth_m, dtype=np.float32)
-        valid = np.isfinite(D) & (D > 0) & (D <= max_depth_m)
-        n_total = D.size
-        n_valid = int(np.count_nonzero(valid))
-        n_nan = int(np.count_nonzero(~np.isfinite(D)))
-        n_le0 = int(np.count_nonzero(np.isfinite(D) & (D <= 0)))
-        n_gt = int(np.count_nonzero(np.isfinite(D) & (D > max_depth_m)))
-
-        if n_valid:
-            vals = D[valid]
-            dmin, dmax = float(np.min(vals)), float(np.max(vals))
-            dmed = float(np.median(vals))
-            d95 = float(np.percentile(vals, 95))
-        else:
-            dmin = dmax = dmed = d95 = float('nan')
-
-        rows = [
-            ("Resolution", f"{D.shape[1]} × {D.shape[0]}"),
-            (f"Valid (≤ {max_depth_m:g} m)", f"{n_valid:,} / {n_total:,}"),
-            ("NaN/Inf", f"{n_nan:,}"),
-            ("≤ 0 m", f"{n_le0:,}"),
-            (f"> {max_depth_m:g} m", f"{n_gt:,}"),
-            ("Min/Max (valid)", f"{dmin:.3g} / {dmax:.3g} m"),
-            ("Median / P95", f"{dmed:.3g} / {d95:.3g} m"),
-        ]
-        for r, (k, vtxt) in enumerate(rows):
-            stats_layout.addWidget(QtWidgets.QLabel(k), r, 0)
-            val = QtWidgets.QLabel(vtxt); val.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-            stats_layout.addWidget(val, r, 1)
-
-        v.addWidget(stats_box)
-
-        # Plots (matplotlib)
-        from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-        from matplotlib.figure import Figure
-        fig = Figure(figsize=(6.4, 3.8), dpi=100)
-        canvas = FigureCanvas(fig)
-        ax1 = fig.add_subplot(1, 2, 1)
-        ax2 = fig.add_subplot(1, 2, 2)
-        fig.tight_layout(pad=2.0, w_pad=2.5)
-
-        # Histogram
-        ax1.set_title(f"Histogram (≤ {max_depth_m:g} m)")
-        if n_valid:
-            ax1.hist(vals, bins=100, range=(0, min(max_depth_m, max(5.0, float(np.nanpercentile(vals, 99.5))))), alpha=0.8)
-            ax1.set_xlabel("Depth (m)"); ax1.set_ylabel("Count")
-        else:
-            ax1.text(0.5, 0.5, "No valid data", ha='center', va='center', transform=ax1.transAxes)
-            ax1.set_xticks([]); ax1.set_yticks([])
-
-        # Preview image
-        ax2.set_title("Preview")
-        # Build RGB preview: valid depths mapped with 'viridis', NaN gray, >max red
-        vis = np.zeros((*D.shape, 3), dtype=np.float32)
-        mask_valid = valid
-        mask_nan = ~np.isfinite(D)
-        mask_big = np.isfinite(D) & (D > max_depth_m)
-
-        if n_valid:
-            vmin = max(0.0, float(np.min(D[mask_valid])))
-            vmax = float(np.percentile(D[mask_valid], 99.0))
-            vmax = max(vmax, vmin + 1e-3)
-            norm = (np.clip(D, vmin, vmax) - vmin) / (vmax - vmin)
-            import matplotlib.cm as cm
-            cmap = cm.get_cmap('viridis')
-            vis[mask_valid] = cmap(norm)[..., :3][mask_valid]
-        vis[mask_nan] = np.array([0.5, 0.5, 0.5])    # gray
-        vis[mask_big] = np.array([1.0, 0.0, 0.0])    # red
-        ax2.imshow(vis)
-        ax2.axis('off')
-
-        v.addWidget(canvas)
-
-        # Close
-        btn = QtWidgets.QPushButton("Close")
-        btn.clicked.connect(self.accept)
-        btn.setFixedWidth(96)
-        btn.setMinimumHeight(26)
-        h = QtWidgets.QHBoxLayout()
-        h.addStretch(1); h.addWidget(btn)
-        v.addLayout(h)
-
-
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Sonar–Camera Simulator (RGB+Depth)")
+        self.setWindowTitle("Sonar–Camera Simulator (Extrinsics & Elevation Ambiguity)")
         self.resize(1400, 900)
 
-        self.rgb = None                # uint8 HxWx3
-        self.depth = None              # float32 meters (NaN invalid)
-        self.K = None                  # (fx, fy, cx, cy)
-        self.image_size = (0, 0)       # (W, H)
+        # Current GUI values (not yet applied until 'Update config')
+        self.image_size = (640, 480)     # (W, H)
+        self.K = (600.0, 600.0, 320.0, 240.0)  # fx, fy, cx, cy
+        self.sonar_points = []           # {'az','r','color'}
+
+        # Last applied config (used by views)
+        self.applied_K = self.K
+        self.applied_image_size = self.image_size
+        self.applied_T_cam_from_sonar = np.eye(4, dtype=np.float32)
+        self.applied_sonar = SonarModel(0.5, 30.0, 128, 180, 20.0,
+                                        orientation=ScanOrientation.horizontal,
+                                        sector_start_deg=-60.0, sector_end_deg=60.0)
 
         splitter = QtWidgets.QSplitter(self)
         splitter.setOrientation(QtCore.Qt.Horizontal)
         self.setCentralWidget(splitter)
 
-        # ===== Left: SINGLE, NARROW, SCROLLABLE COLUMN =====
+        # ===== LEFT: narrow scrollable column =====
         left_container = QtWidgets.QWidget()
         left_v = QtWidgets.QVBoxLayout(left_container)
         left_v.setContentsMargins(6, 6, 6, 6)
@@ -253,8 +114,7 @@ class MainWindow(QtWidgets.QMainWindow):
         host_v.setContentsMargins(0, 0, 0, 0)
         host_v.setSpacing(6)
 
-        # Small spin helpers
-        def dspin(minv, maxv, val, decimals=3, step=None):
+        def dspin(minv, maxv, val, decimals=2, step=None):
             s = QtWidgets.QDoubleSpinBox()
             s.setRange(minv, maxv)
             s.setDecimals(decimals)
@@ -269,44 +129,13 @@ class MainWindow(QtWidgets.QMainWindow):
             s.setSingleStep(step)
             return s
 
-        # ---------- Inputs (boxed) ----------
-        inputs_box, inputs_v = _section("Inputs")
-        self.btn_rgb = QtWidgets.QPushButton("Load RGB");   self.btn_rgb.setMaximumWidth(128)
-        self.lbl_rgb = _lab("—", small=True, color="#555")
-        self.btn_depth = QtWidgets.QPushButton("Load Depth"); self.btn_depth.setMaximumWidth(128)
-        # Inspect button
-        self.btn_inspect = QtWidgets.QPushButton("Inspect"); self.btn_inspect.setMaximumWidth(80)
-        self.lbl_depth = _lab("—", small=True, color="#555")
-        # Depth scale: 1 decimal, step 0.1
-        self.depth_scale = dspin(1e-6, 1e3, 1.0, decimals=1, step=0.1)
-        self.downsample  = ispin(1, 8, 2)
-        # NEW: user-selectable maximum usable depth (meters)
-        self.depth_max   = dspin(0.1, 10000.0, 100.0, decimals=1, step=1.0)
-
-        inputs_v.addWidget(self.btn_rgb)
-        inputs_v.addWidget(self.lbl_rgb)
-
-        row = QtWidgets.QHBoxLayout()
-        row.setSpacing(6)
-        row.addWidget(self.btn_depth)
-        row.addWidget(self.btn_inspect)
-        row.addStretch(1)
-        inputs_v.addLayout(row)
-
-        inputs_v.addWidget(self.lbl_depth)
-        inputs_v.addWidget(_param_row("Depth scale", "[m / unit]", self.depth_scale))
-        inputs_v.addWidget(_param_row("Depth max", "[m]", self.depth_max))
-        inputs_v.addWidget(_param_row("Downsample", "[px step]", self.downsample))
-        host_v.addWidget(inputs_box)
-
-        # ---------- Camera (boxed) ----------
+        # --- CAMERA ---
         cam_box, cam_v = _section("Camera")
         self.fx = dspin(1, 10000, 600.0, decimals=2)
         self.fy = dspin(1, 10000, 600.0, decimals=2)
         self.cx = dspin(0, 8192, 320.0, decimals=2)
         self.cy = dspin(0, 8192, 240.0, decimals=2)
-        self.w  = ispin(16, 8192, 640)
-        self.h  = ispin(16, 8192, 480)
+        self.w  = ispin(16, 8192, 640); self.h = ispin(16, 8192, 480)
         cam_v.addWidget(_param_row("fx", "[px]", self.fx))
         cam_v.addWidget(_param_row("fy", "[px]", self.fy))
         cam_v.addWidget(_param_row("cx", "[px]", self.cx))
@@ -315,39 +144,30 @@ class MainWindow(QtWidgets.QMainWindow):
         cam_v.addWidget(_param_row("height", "[px]", self.h))
         host_v.addWidget(cam_box)
 
-        # ---------- Sonar (boxed) ----------
-        sonar_box, sonar_v = _section("Sonar")
-        self.range_min = dspin(0.0, 10000.0, 0.5, decimals=3)
-        self.range_max = dspin(0.1, 10000.0, 30.0, decimals=3)
-        self.num_bins  = ispin(16, 4096, 384)
-        self.num_beams = ispin(16, 4096, 540)
-        self.elev_fov  = dspin(0.1, 180.0, 20.0, decimals=2)
-        self.orientation = QtWidgets.QComboBox(); self.orientation.addItems(["horizontal", "vertical"])
-        self.orientation.setMaximumWidth(96)
-        self.sector_start = dspin(-360.0, 360.0, -60.0, decimals=2)
-        self.sector_end   = dspin(-360.0, 360.0, +60.0, decimals=2)
-
+        # --- SONAR (FOV only; centered on +X acoustic axis) ---
+        sonar_box, sonar_v = _section("Sonar FOV")
+        self.range_min = dspin(0.0, 10000.0, 0.5, decimals=2)
+        self.range_max = dspin(0.1, 10000.0, 30.0, decimals=2)
+        self.elev_fov  = dspin(0.1, 180.0, 20.0, decimals=1)
+        self.sector_start = dspin(-360.0, 360.0, -60.0, decimals=1)
+        self.sector_end   = dspin(-360.0, 360.0, +60.0, decimals=1)
         sonar_v.addWidget(_param_row("range min", "[m]", self.range_min))
         sonar_v.addWidget(_param_row("range max", "[m]", self.range_max))
-        sonar_v.addWidget(_param_row("num bins", "[—]", self.num_bins))
-        sonar_v.addWidget(_param_row("num beams", "[—]", self.num_beams))
         sonar_v.addWidget(_param_row("elev FOV", "[deg]", self.elev_fov))
-        sonar_v.addWidget(_param_row("orientation", "[mode]", self.orientation))
         sonar_v.addWidget(_param_row("sector start", "[deg]", self.sector_start))
         sonar_v.addWidget(_param_row("sector end", "[deg]", self.sector_end))
         host_v.addWidget(sonar_box)
 
-        # ---------- Extrinsics (boxed) ----------
+        # --- EXTRINSICS (cam frame) ---
         extr_box, extr_v = _section("Extrinsics (cam frame)")
-        self.tx = dspin(-10, 10, -0.20, decimals=4)  # sonar left of camera
-        self.ty = dspin(-10, 10, 0.0, decimals=4)
-        self.tz = dspin(-10, 10, 0.0, decimals=4)
-        self.r_roll  = dspin(-180.0, 180.0, 0.0, decimals=2)
-        self.r_pitch = dspin(-180.0, 180.0, 0.0, decimals=2)
-        self.r_yaw   = dspin(-180.0, 180.0, 0.0, decimals=2)
+        self.tx = dspin(-10, 10, -0.20, decimals=3)
+        self.ty = dspin(-10, 10, 0.0, decimals=3)
+        self.tz = dspin(-10, 10, 0.0, decimals=3)
+        self.r_roll  = dspin(-180.0, 180.0, 0.0, decimals=1)
+        self.r_pitch = dspin(-180.0, 180.0, 0.0, decimals=1)
+        self.r_yaw   = dspin(-180.0, 180.0, 0.0, decimals=1)
         for wdg in (self.tx, self.ty, self.tz, self.r_roll, self.r_pitch, self.r_yaw):
             wdg.setMaximumWidth(96)
-
         extr_v.addWidget(_param_row("tx", "[m]", self.tx))
         extr_v.addWidget(_param_row("ty", "[m]", self.ty))
         extr_v.addWidget(_param_row("tz", "[m]", self.tz))
@@ -356,212 +176,156 @@ class MainWindow(QtWidgets.QMainWindow):
         extr_v.addWidget(_param_row("yaw", "[deg]", self.r_yaw))
         host_v.addWidget(extr_box)
 
-        # Actions
-        self.btn_render = QtWidgets.QPushButton("Render")
-        self.btn_render.setMaximumWidth(128)
-        self.btn_render.setMinimumHeight(28)
-        host_v.addWidget(self.btn_render)
+        # --- APPLY CONFIG BUTTON ---
+        self.btn_update = QtWidgets.QPushButton("Update camera/sonar config")
+        self.btn_update.setMinimumHeight(28)
+        self.btn_update.setMaximumWidth(220)
+        host_v.addWidget(self.btn_update)
+
+        # --- SONAR POINTS (az + range) ---
+        pts_box, pts_v = _section("Sonar Points → Camera")
+        self.az  = dspin(-180.0, 180.0, 0.0, decimals=2, step=1.0)
+        self.rng = dspin(0.01, 10000.0, 5.0, decimals=2, step=0.1)
+        self.color = QtGui.QColor(0, 200, 255)
+        self.btn_color = QtWidgets.QPushButton("Color"); self.btn_color.setMaximumWidth(72)
+        self.btn_color.clicked.connect(self.on_pick_color)
+        self._update_color_button()
+        pts_v.addWidget(_param_row("azimuth", "[deg]", self.az))
+        pts_v.addWidget(_param_row("range", "[m]", self.rng))
+        rowc = QtWidgets.QHBoxLayout(); rowc.setSpacing(6)
+        rowc.addWidget(self.btn_color)
+        self.btn_add = QtWidgets.QPushButton("Add");   self.btn_add.setMaximumWidth(72)
+        self.btn_clear = QtWidgets.QPushButton("Clear"); self.btn_clear.setMaximumWidth(72)
+        rowc.addWidget(self.btn_add); rowc.addWidget(self.btn_clear); rowc.addStretch(1)
+        pts_v.addLayout(rowc)
+        self.list_pts = QtWidgets.QListWidget(); self.list_pts.setMaximumHeight(160)
+        pts_v.addWidget(self.list_pts)
+        host_v.addWidget(pts_box)
 
         host_v.addStretch(1)
         scroll.setWidget(host)
         left_v.addWidget(scroll)
         splitter.addWidget(left_container)
 
-        # Keep the left column narrow
-        left_container.setMinimumWidth(210)
-        left_container.setMaximumWidth(240)
+        # Left column width
+        left_container.setMinimumWidth(200)
+        left_container.setMaximumWidth(220)
 
-        # ===== Right: 2×2 GRID (big views) =====
+        # ===== RIGHT: World (top) + Projection (bottom) =====
         right = QtWidgets.QWidget()
         RG = QtWidgets.QGridLayout(right)
-        RG.setContentsMargins(4, 4, 4, 4)
-        RG.setHorizontalSpacing(6)
-        RG.setVerticalSpacing(6)
+        RG.setContentsMargins(2, 2, 2, 2)
+        RG.setHorizontalSpacing(4)
+        RG.setVerticalSpacing(4)
 
         self.world = WorldView3D()
+        self.world.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
         RG.addWidget(self.world, 0, 0)
 
-        self.lbl_rgb_view = QtWidgets.QLabel(); self.lbl_rgb_view.setAlignment(QtCore.Qt.AlignCenter)
-        self.lbl_rgb_view.setStyleSheet("QLabel { border: 1px solid #333; }")
-        self.lbl_rgb_view.setScaledContents(True)
-        RG.addWidget(self.lbl_rgb_view, 0, 1)
+        self.proj = ProjectionView()
+        self.proj.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        RG.addWidget(self.proj, 1, 0)
 
-        self.lbl_sonar = QtWidgets.QLabel(); self.lbl_sonar.setAlignment(QtCore.Qt.AlignCenter)
-        self.lbl_sonar.setStyleSheet("QLabel { border: 1px solid #333; }")
-        self.lbl_sonar.setScaledContents(True)
-        RG.addWidget(self.lbl_sonar, 1, 0)
-
-        self.lbl_overlay = QtWidgets.QLabel(); self.lbl_overlay.setAlignment(QtCore.Qt.AlignCenter)
-        self.lbl_overlay.setStyleSheet("QLabel { border: 1px solid #333; }")
-        self.lbl_overlay.setScaledContents(True)
-        RG.addWidget(self.lbl_overlay, 1, 1)
-
-        RG.setRowStretch(0, 1); RG.setRowStretch(1, 1)
-        RG.setColumnStretch(0, 1); RG.setColumnStretch(1, 1)
+        RG.setRowStretch(0, 1)
+        RG.setRowStretch(1, 1)
+        RG.setColumnStretch(0, 1)
 
         splitter.addWidget(right)
-        splitter.setStretchFactor(0, 0)  # left fixed-ish
-        splitter.setStretchFactor(1, 1)  # right expands
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
 
         # Hooks
-        self.btn_rgb.clicked.connect(self.on_load_rgb)
-        self.btn_depth.clicked.connect(self.on_load_depth)
-        self.btn_inspect.clicked.connect(self.on_inspect_depth)
-        self.btn_render.clicked.connect(self.on_render)
+        self.btn_update.clicked.connect(self.on_update_config)
+        self.btn_add.clicked.connect(self.on_add_point)
+        self.btn_clear.clicked.connect(self.on_clear_points)
 
-    # --------- Loaders ----------
-    def _assert_ext(self, path, allowed_exts, kind):
-        ext = os.path.splitext(path)[1].lower()
-        if ext not in allowed_exts:
-            raise ValueError(f"{kind} file must be one of: {', '.join(allowed_exts)} (got '{ext}')")
+        # Initial apply
+        self.on_update_config()
 
-    def on_load_rgb(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open RGB", "", "Images (*.png *.tif *.tiff)")
-        if not path: return
-        try:
-            self._assert_ext(path, {".png", ".tif", ".tiff"}, "RGB")
-            im = Image.open(path).convert("RGB")
-            self.rgb = np.array(im, dtype=np.uint8)
-            H, W, _ = self.rgb.shape
-            self.w.setValue(W); self.h.setValue(H)
-            if self.cx.value() == 320.0 and self.cy.value() == 240.0:
-                self.cx.setValue(W/2); self.cy.setValue(H/2)
-            self.image_size = (W, H)
-            self.lbl_rgb.setText(path)
-            self.lbl_rgb_view.setPixmap(np_to_qpixmap(self.rgb))
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Load RGB failed", str(e))
+    # --------- UI handlers ----------
+    def _update_color_button(self):
+        c = self.color
+        self.btn_color.setStyleSheet(
+            f"QPushButton {{ background-color: {c.name()}; color: #000; border: 1px solid #444; }}"
+        )
 
-    def on_load_depth(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open Depth", "", "Depth (*.npy *.tif *.tiff)")
-        if not path: return
-        try:
-            self._assert_ext(path, {".npy", ".tif", ".tiff"}, "Depth")
-            if path.lower().endswith(".npy"):
-                D = np.load(path)
-            else:
-                im = Image.open(path)
-                if im.mode not in ("I;16", "I", "F"):
-                    im = im.convert("I;16")
-                D = np.array(im)
-            if D.ndim == 3 and D.shape[2] == 1: D = D[..., 0]
-            if D.ndim != 2:
-                raise ValueError(f"Depth must be single-channel (HxW). Got shape {D.shape}.")
-            D = np.array(D, dtype=np.float32) * float(self.depth_scale.value())
+    def on_pick_color(self):
+        c = QtWidgets.QColorDialog.getColor(self.color, self, "Pick Color")
+        if c.isValid():
+            self.color = c
+            self._update_color_button()
 
-            # Sanitize: invalid → NaN; ignore > depth_max → NaN
-            max_d = float(self.depth_max.value())
-            invalid = ~np.isfinite(D) | (D <= 0.0) | (D > max_d)
-            if np.any(invalid): D[invalid] = np.nan
+    def _refresh_points_list(self):
+        """Rebuild list items with current arc length suffixes (if available)."""
+        self.list_pts.clear()
+        lengths = getattr(self.proj, "last_lengths", [])
+        for i, p in enumerate(self.sonar_points):
+            suffix = ""
+            if i < len(lengths) and np.isfinite(lengths[i]):
+                suffix = f" — L={lengths[i]:.1f}px"
+            self.list_pts.addItem(f"az={p['az']:.1f}°, r={p['r']:.2f} m{suffix}")
 
-            self.depth = D
-            H, W = D.shape
-            n_valid = int(np.isfinite(D).sum())
-            self.lbl_depth.setText(f"{path}  |  valid: {n_valid:,} / {H*W:,}")
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Load depth failed", str(e))
+    def on_add_point(self):
+        az = float(self.az.value()); r = float(self.rng.value())
+        col = (self.color.red(), self.color.green(), self.color.blue())
+        self.sonar_points.append({'az': az, 'r': r, 'color': col})
+        self.redraw_projection()
 
-    def on_inspect_depth(self):
-        if self.depth is None:
-            QtWidgets.QMessageBox.information(self, "No depth", "Load a depth map first.")
-            return
-        # Ensure > max depth is invalid in case the scale or max changed
-        D = np.array(self.depth, dtype=np.float32)
-        max_d = float(self.depth_max.value())
-        mask_bad = np.isfinite(D) & (D > max_d)
-        if np.any(mask_bad): D[mask_bad] = np.nan
-        dlg = DepthInspectorDialog(D, max_d, self)
-        dlg.exec_()
+    def on_clear_points(self):
+        self.sonar_points.clear()
+        self.redraw_projection()
 
-    # --------- Pipeline ----------
-    def on_render(self):
-        if self.rgb is None or self.depth is None:
-            QtWidgets.QMessageBox.warning(self, "Missing input", "Please load both RGB (png/tif) and Depth (npy/tif).")
-            return
-
-        fx, fy, cx, cy = float(self.fx.value()), float(self.fy.value()), float(self.cx.value()), float(self.cy.value())
-        W, H = int(self.w.value()), int(self.h.value())
-        if (self.rgb.shape[1], self.rgb.shape[0]) != (W, H):
-            self.rgb = np.array(Image.fromarray(self.rgb).resize((W, H), Image.BILINEAR))
-        if (self.depth.shape[1], self.depth.shape[0]) != (W, H):
-            Dimg = Image.fromarray(self.depth, mode="F").resize((W, H), Image.NEAREST)
-            self.depth = np.array(Dimg, dtype=np.float32)
-
-        # Enforce ignore > max depth (again, in case values/scale changed)
-        D = np.array(self.depth, dtype=np.float32)
-        max_d = float(self.depth_max.value())
-        bad = ~np.isfinite(D) | (D <= 0.0) | (D > max_d)
-        if np.any(bad): D[bad] = np.nan
-        self.depth = D
-
-        self.K = (fx, fy, cx, cy)
-        self.image_size = (W, H)
-
-        # Extrinsics (degrees) with base alignment
+    # --------- Config apply / math helpers ----------
+    def _camera_T_from_sonar(self):
         R_base = sonar_to_cam_base_R()
         roll_deg, pitch_deg, yaw_deg = self.r_roll.value(), self.r_pitch.value(), self.r_yaw.value()
         R_user = rpy_to_R(np.deg2rad(roll_deg), np.deg2rad(pitch_deg), np.deg2rad(yaw_deg))
         R_cs = (R_base @ R_user).astype(np.float32)  # sonar->camera
         t_cs = np.array([self.tx.value(), self.ty.value(), self.tz.value()], dtype=np.float32)
-        T_cam_from_sonar = Rt_to_T(R_cs, t_cs)       # sonar->camera
-        T_cam_to_sonar   = inv_T(T_cam_from_sonar)   # camera->sonar
+        return Rt_to_T(R_cs, t_cs)
 
-        # Point cloud from depth (camera frame)
-        ds = int(self.downsample.value())
-        pts_c, uv = depth_to_points(self.depth, fx, fy, cx, cy, downsample=ds, max_depth_m=max_d)
-        if pts_c.shape[0] == 0:
-            QtWidgets.QMessageBox.warning(self, "Empty cloud", f"No valid depth points after sanitization (≤ {max_d:g} m).")
-            return
-
+    def _gather_config(self):
+        fx, fy, cx, cy = float(self.fx.value()), float(self.fy.value()), float(self.cx.value()), float(self.cy.value())
+        W, H = int(self.w.value()), int(self.h.value())
+        K = (fx, fy, cx, cy)
         sonar = SonarModel(
-            range_min=self.range_min.value(), range_max=self.range_max.value(),
-            num_bins=self.num_bins.value(), num_beams=self.num_beams.value(),
+            range_min=self.range_min.value(),
+            range_max=self.range_max.value(),
+            num_bins=128,
+            num_beams=180,
             elevation_fov_deg=self.elev_fov.value(),
-            orientation=ScanOrientation(self.orientation.currentText()),
-            sector_start_deg=self.sector_start.value(), sector_end_deg=self.sector_end.value(),
+            orientation=ScanOrientation.horizontal,  # not used; extrinsics define pose
+            sector_start_deg=self.sector_start.value(),
+            sector_end_deg=self.sector_end.value(),
+        )
+        T_cam_from_sonar = self._camera_T_from_sonar()
+        return K, (W, H), sonar, T_cam_from_sonar
+
+    def on_update_config(self):
+        # Apply current GUI values
+        K, image_size, sonar, T_cs = self._gather_config()
+        self.applied_K = K
+        self.applied_image_size = image_size
+        self.applied_sonar = sonar
+        self.applied_T_cam_from_sonar = T_cs
+
+        # Update 3D world (axes + volumes only)
+        self.world.update_scene(
+            K=self.applied_K,
+            image_size=self.applied_image_size,
+            T_cam_from_sonar=self.applied_T_cam_from_sonar,
+            sonar=self.applied_sonar
         )
 
-        polar, used_mask, angle_grid = render_sonar_from_depth(pts_c, uv, sonar, T_cam_to_sonar)
+        # Redraw projection with applied config
+        self.redraw_projection()
 
-        # Minimal-whitespace fan image
-        fan = polar_to_fan_image(
-            polar.astype(np.uint8),
-            sonar.range_min, sonar.range_max, angle_grid,
-            out_size=360, grid_rings=6, angle_step_deg=15, show_labels=True,
-            top_pad_px=2, side_pad_px=2, bottom_pad_px=4
+    def redraw_projection(self):
+        W, H = self.applied_image_size
+        self.proj.update_projection(
+            W=W, H=H, K=self.applied_K,
+            T_cam_from_sonar=self.applied_T_cam_from_sonar,
+            sonar=self.applied_sonar,
+            samples=self.sonar_points
         )
-
-        overlay = self.draw_points(self.rgb, uv[used_mask], color=(0, 200, 255), radius=2)
-
-        self.lbl_rgb_view.setPixmap(np_to_qpixmap(self.rgb))
-        self.lbl_sonar.setPixmap(np_to_qpixmap(fan))
-        self.lbl_overlay.setPixmap(np_to_qpixmap(overlay))
-
-        self.world.update_scene(pts_c, T_cam_to_sonar, sonar)
-
-    # ---- overlay drawing ----
-    def draw_points(self, img, uv, color=(255, 0, 0), radius=2):
-        try:
-            import cv2
-            out = img.copy()
-            rr, gg, bb = int(color[0]), int(color[1]), int(color[2])
-            bgr = (bb, gg, rr)
-            for p in uv:
-                if not (np.isfinite(p[0]) and np.isfinite(p[1])): 
-                    continue
-                cv2.circle(out, (int(round(p[0])), int(round(p[1]))), radius, bgr, thickness=-1, lineType=cv2.LINE_AA)
-            return out
-        except Exception:
-            H, W, _ = img.shape
-            out = img.copy()
-            rr, gg, bb = color
-            for p in uv:
-                if not (np.isfinite(p[0]) and np.isfinite(p[1])): 
-                    continue
-                x = int(round(p[0])); y = int(round(p[1]))
-                for dy in range(-radius, radius + 1):
-                    for dx in range(-radius, radius + 1):
-                        xx = x + dx; yy = y + dy
-                        if 0 <= xx < W and 0 <= yy < H and dx*dx + dy*dy <= radius*radius:
-                            out[yy, xx, 0] = rr; out[yy, xx, 1] = gg; out[yy, xx, 2] = bb
-            return out
+        self._refresh_points_list()
