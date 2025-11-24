@@ -2,7 +2,7 @@
 
 A simple sonar camera simulator. It takes in an RGB and Depth image and renders sonar image and test different way of projecting sonar data into camera'a frame. User can cahneg camera and sonar intrinsics as well as extrinsics between camera and sonar.
 
-![alt text](<asset/Screenshot 2025-09-14 224425.png>)
+![alt text](<asset/demo.png>)
 
 ## Install
 ```bash
