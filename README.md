@@ -1,6 +1,6 @@
 # Sonar–Camera Simulator
 
-A simple sonar camera simulator. It takes in an RGB and Depth image and renders sonar image and test different way of projecting sonar data into camera'a frame. User can cahneg camera and sonar intrinsics as well as extrinsics between camera and sonar.
+A simple sonar–camera simulator. Users can change the camera and sonar intrinsics, as well as the extrinsics between the camera and sonar. The visualizer shows how the sensors are oriented and how their fields of view overlap. The second figure shows how a sonar pixel is projected into the camera’s view.
 
 ![alt text](<asset/demo.png>)
 
