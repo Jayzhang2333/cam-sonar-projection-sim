@@ -24,18 +24,21 @@ def _lab(text, small=False, bold=False, color="#000"):
     lbl = QtWidgets.QLabel(text)
     lbl.setWordWrap(True)
     style = []
-    if small: style.append("font-size: 10px;")
-    if bold:  style.append("font-weight: 700;")
+    if small:
+        style.append("font-size: 12px;")  # increased from 11px
+    # Non-small labels inherit the window font size
+    if bold:
+        style.append("font-weight: 700;")
     style.append(f"color: {color};")
     lbl.setStyleSheet("".join(style))
     return lbl
 
 
-def _param_row(name, unit, widget, value_width=96, label_width=112):
+def _param_row(name, unit, widget, value_width=110, label_width=120):
     w = QtWidgets.QWidget()
     g = QtWidgets.QGridLayout(w)
-    g.setContentsMargins(2, 2, 2, 2)
-    g.setHorizontalSpacing(2)
+    g.setContentsMargins(2, 4, 2, 4)
+    g.setHorizontalSpacing(4)
     g.setVerticalSpacing(0)
 
     name_lbl = _lab(name, small=False, bold=False)
@@ -44,7 +47,7 @@ def _param_row(name, unit, widget, value_width=96, label_width=112):
     unit_lbl.setFixedWidth(label_width)
 
     widget.setMaximumWidth(value_width)
-    widget.setMinimumHeight(22)
+    widget.setMinimumHeight(26)  # slightly taller
     widget.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
 
     g.addWidget(name_lbl, 0, 0, 1, 1, QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
@@ -57,7 +60,9 @@ def _param_row(name, unit, widget, value_width=96, label_width=112):
 
 def _section(title: str):
     gb = QtWidgets.QGroupBox(title)
-    f = gb.font(); f.setBold(True); gb.setFont(f)
+    f = gb.font()
+    f.setBold(True)
+    gb.setFont(f)
     gb.setFlat(False)
     gb.setStyleSheet("""
         QGroupBox {
@@ -84,6 +89,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle("Sonar–Camera Simulator (Extrinsics & Elevation Ambiguity)")
         self.resize(1400, 900)
 
+        # Increase base font size for the whole window (more aggressive bump)
+        base_font = self.font()
+        if base_font.pointSize() > 0:
+            base_font.setPointSize(max(base_font.pointSize() + 4, 13))
+        else:
+            base_font.setPointSize(13)
+        self.setFont(base_font)
+
         # Current GUI values (not yet applied until 'Update config')
         self.image_size = (640, 480)     # (W, H)
         self.K = (600.0, 600.0, 320.0, 240.0)  # fx, fy, cx, cy
@@ -93,15 +106,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.applied_K = self.K
         self.applied_image_size = self.image_size
         self.applied_T_cam_from_sonar = np.eye(4, dtype=np.float32)
-        self.applied_sonar = SonarModel(0.5, 30.0, 128, 180, 20.0,
-                                        orientation=ScanOrientation.horizontal,
-                                        sector_start_deg=-60.0, sector_end_deg=60.0)
+        self.applied_sonar = SonarModel(
+            0.5, 30.0, 128, 180, 20.0,
+            orientation=ScanOrientation.horizontal,
+            sector_start_deg=-60.0, sector_end_deg=60.0
+        )
 
         splitter = QtWidgets.QSplitter(self)
         splitter.setOrientation(QtCore.Qt.Horizontal)
         self.setCentralWidget(splitter)
 
-        # ===== LEFT: narrow scrollable column =====
+        # ===== LEFT: scrollable controls column =====
         left_container = QtWidgets.QWidget()
         left_v = QtWidgets.QVBoxLayout(left_container)
         left_v.setContentsMargins(6, 6, 6, 6)
@@ -119,7 +134,9 @@ class MainWindow(QtWidgets.QMainWindow):
             s.setRange(minv, maxv)
             s.setDecimals(decimals)
             s.setValue(val)
-            if step is not None: s.setSingleStep(step)
+            if step is not None:
+                s.setSingleStep(step)
+            s.setMinimumHeight(26)
             return s
 
         def ispin(minv, maxv, val, step=1):
@@ -127,6 +144,7 @@ class MainWindow(QtWidgets.QMainWindow):
             s.setRange(minv, maxv)
             s.setValue(val)
             s.setSingleStep(step)
+            s.setMinimumHeight(26)
             return s
 
         # --- CAMERA ---
@@ -135,7 +153,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.fy = dspin(1, 10000, 600.0, decimals=2)
         self.cx = dspin(0, 8192, 320.0, decimals=2)
         self.cy = dspin(0, 8192, 240.0, decimals=2)
-        self.w  = ispin(16, 8192, 640); self.h = ispin(16, 8192, 480)
+        self.w = ispin(16, 8192, 640)
+        self.h = ispin(16, 8192, 480)
         cam_v.addWidget(_param_row("fx", "[px]", self.fx))
         cam_v.addWidget(_param_row("fy", "[px]", self.fy))
         cam_v.addWidget(_param_row("cx", "[px]", self.cx))
@@ -148,9 +167,9 @@ class MainWindow(QtWidgets.QMainWindow):
         sonar_box, sonar_v = _section("Sonar FOV")
         self.range_min = dspin(0.0, 10000.0, 0.5, decimals=2)
         self.range_max = dspin(0.1, 10000.0, 30.0, decimals=2)
-        self.elev_fov  = dspin(0.1, 180.0, 20.0, decimals=1)
+        self.elev_fov = dspin(0.1, 180.0, 20.0, decimals=1)
         self.sector_start = dspin(-360.0, 360.0, -60.0, decimals=1)
-        self.sector_end   = dspin(-360.0, 360.0, +60.0, decimals=1)
+        self.sector_end = dspin(-360.0, 360.0, +60.0, decimals=1)
         sonar_v.addWidget(_param_row("range min", "[m]", self.range_min))
         sonar_v.addWidget(_param_row("range max", "[m]", self.range_max))
         sonar_v.addWidget(_param_row("elev FOV", "[deg]", self.elev_fov))
@@ -163,11 +182,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tx = dspin(-10, 10, -0.20, decimals=3)
         self.ty = dspin(-10, 10, 0.0, decimals=3)
         self.tz = dspin(-10, 10, 0.0, decimals=3)
-        self.r_roll  = dspin(-180.0, 180.0, 0.0, decimals=1)
+        self.r_roll = dspin(-180.0, 180.0, 0.0, decimals=1)
         self.r_pitch = dspin(-180.0, 180.0, 0.0, decimals=1)
-        self.r_yaw   = dspin(-180.0, 180.0, 0.0, decimals=1)
+        self.r_yaw = dspin(-180.0, 180.0, 0.0, decimals=1)
         for wdg in (self.tx, self.ty, self.tz, self.r_roll, self.r_pitch, self.r_yaw):
-            wdg.setMaximumWidth(96)
+            wdg.setMaximumWidth(110)
         extr_v.addWidget(_param_row("tx", "[m]", self.tx))
         extr_v.addWidget(_param_row("ty", "[m]", self.ty))
         extr_v.addWidget(_param_row("tz", "[m]", self.tz))
@@ -178,27 +197,37 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # --- APPLY CONFIG BUTTON ---
         self.btn_update = QtWidgets.QPushButton("Update camera/sonar config")
-        self.btn_update.setMinimumHeight(28)
-        self.btn_update.setMaximumWidth(220)
+        self.btn_update.setMinimumHeight(30)
+        self.btn_update.setMaximumWidth(240)
         host_v.addWidget(self.btn_update)
 
         # --- SONAR POINTS (az + range) ---
         pts_box, pts_v = _section("Sonar Points → Camera")
-        self.az  = dspin(-180.0, 180.0, 0.0, decimals=2, step=1.0)
+        self.az = dspin(-180.0, 180.0, 0.0, decimals=2, step=1.0)
         self.rng = dspin(0.01, 10000.0, 5.0, decimals=2, step=0.1)
         self.color = QtGui.QColor(0, 200, 255)
-        self.btn_color = QtWidgets.QPushButton("Color"); self.btn_color.setMaximumWidth(72)
+        self.btn_color = QtWidgets.QPushButton("Color")
+        self.btn_color.setMaximumWidth(80)
+        self.btn_color.setMinimumHeight(28)
         self.btn_color.clicked.connect(self.on_pick_color)
         self._update_color_button()
         pts_v.addWidget(_param_row("azimuth", "[deg]", self.az))
         pts_v.addWidget(_param_row("range", "[m]", self.rng))
-        rowc = QtWidgets.QHBoxLayout(); rowc.setSpacing(6)
+        rowc = QtWidgets.QHBoxLayout()
+        rowc.setSpacing(6)
         rowc.addWidget(self.btn_color)
-        self.btn_add = QtWidgets.QPushButton("Add");   self.btn_add.setMaximumWidth(72)
-        self.btn_clear = QtWidgets.QPushButton("Clear"); self.btn_clear.setMaximumWidth(72)
-        rowc.addWidget(self.btn_add); rowc.addWidget(self.btn_clear); rowc.addStretch(1)
+        self.btn_add = QtWidgets.QPushButton("Add")
+        self.btn_add.setMaximumWidth(80)
+        self.btn_add.setMinimumHeight(28)
+        self.btn_clear = QtWidgets.QPushButton("Clear")
+        self.btn_clear.setMaximumWidth(80)
+        self.btn_clear.setMinimumHeight(28)
+        rowc.addWidget(self.btn_add)
+        rowc.addWidget(self.btn_clear)
+        rowc.addStretch(1)
         pts_v.addLayout(rowc)
-        self.list_pts = QtWidgets.QListWidget(); self.list_pts.setMaximumHeight(160)
+        self.list_pts = QtWidgets.QListWidget()
+        self.list_pts.setMaximumHeight(180)
         pts_v.addWidget(self.list_pts)
         host_v.addWidget(pts_box)
 
@@ -207,16 +236,17 @@ class MainWindow(QtWidgets.QMainWindow):
         left_v.addWidget(scroll)
         splitter.addWidget(left_container)
 
-        # Left column width
-        left_container.setMinimumWidth(200)
-        left_container.setMaximumWidth(220)
+        # Left column width – wider & resizable
+        left_container.setMinimumWidth(280)
 
         # ===== RIGHT: World (top) + Projection (bottom) =====
         right = QtWidgets.QWidget()
         RG = QtWidgets.QGridLayout(right)
-        RG.setContentsMargins(2, 2, 2, 2)
-        RG.setHorizontalSpacing(4)
-        RG.setVerticalSpacing(4)
+
+        # Tighter margins/spacing to reduce white border around figures
+        RG.setContentsMargins(0, 0, 0, 0)
+        RG.setHorizontalSpacing(0)
+        RG.setVerticalSpacing(0)
 
         self.world = WorldView3D()
         self.world.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
@@ -231,8 +261,13 @@ class MainWindow(QtWidgets.QMainWindow):
         RG.setColumnStretch(0, 1)
 
         splitter.addWidget(right)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
+
+        # Splitter stretch: give left a reasonable share and right a bit more
+        splitter.setStretchFactor(0, 1)  # left
+        splitter.setStretchFactor(1, 2)  # right
+
+        # Optional initial sizes (tweak to taste)
+        splitter.setSizes([420, 980])
 
         # Hooks
         self.btn_update.clicked.connect(self.on_update_config)
@@ -266,7 +301,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.list_pts.addItem(f"az={p['az']:.1f}°, r={p['r']:.2f} m{suffix}")
 
     def on_add_point(self):
-        az = float(self.az.value()); r = float(self.rng.value())
+        az = float(self.az.value())
+        r = float(self.rng.value())
         col = (self.color.red(), self.color.green(), self.color.blue())
         self.sonar_points.append({'az': az, 'r': r, 'color': col})
         self.redraw_projection()
@@ -278,15 +314,27 @@ class MainWindow(QtWidgets.QMainWindow):
     # --------- Config apply / math helpers ----------
     def _camera_T_from_sonar(self):
         R_base = sonar_to_cam_base_R()
-        roll_deg, pitch_deg, yaw_deg = self.r_roll.value(), self.r_pitch.value(), self.r_yaw.value()
-        R_user = rpy_to_R(np.deg2rad(roll_deg), np.deg2rad(pitch_deg), np.deg2rad(yaw_deg))
+        roll_deg, pitch_deg, yaw_deg = (
+            self.r_roll.value(),
+            self.r_pitch.value(),
+            self.r_yaw.value()
+        )
+        R_user = rpy_to_R(
+            np.deg2rad(roll_deg),
+            np.deg2rad(pitch_deg),
+            np.deg2rad(yaw_deg)
+        )
         R_cs = (R_base @ R_user).astype(np.float32)  # sonar->camera
         t_cs = np.array([self.tx.value(), self.ty.value(), self.tz.value()], dtype=np.float32)
         return Rt_to_T(R_cs, t_cs)
 
     def _gather_config(self):
-        fx, fy, cx, cy = float(self.fx.value()), float(self.fy.value()), float(self.cx.value()), float(self.cy.value())
-        W, H = int(self.w.value()), int(self.h.value())
+        fx = float(self.fx.value())
+        fy = float(self.fy.value())
+        cx = float(self.cx.value())
+        cy = float(self.cy.value())
+        W = int(self.w.value())
+        H = int(self.h.value())
         K = (fx, fy, cx, cy)
         sonar = SonarModel(
             range_min=self.range_min.value(),
